@@ -14,8 +14,8 @@ VAULT_FILE="${VAULT_DIR}/test-project.vault"
 mkdir -p "${VAULT_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../secret-vault-helpers/ui.sh"
-source "${SCRIPT_DIR}/../secret-vault-helpers/crypto.sh"
+source "${SCRIPT_DIR}/../secret-vault/ui.sh"
+source "${SCRIPT_DIR}/../secret-vault/crypto.sh"
 
 # Stub master password — skip keychain during tests
 crypto_get_master_password() { echo "test-password-123"; }
@@ -23,7 +23,7 @@ crypto_load_master_password() { return 1; }
 # Stub ui_confirm to always say yes
 ui_confirm() { return 0; }
 
-source "${SCRIPT_DIR}/../secret-vault-helpers/import-env.sh"
+source "${SCRIPT_DIR}/../secret-vault/import-env.sh"
 
 # ---------------------------------------------------------------------------
 assert_eq() {

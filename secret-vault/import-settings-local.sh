@@ -35,7 +35,7 @@ import_settings_local() {
     ddev_status=$(ddev describe -j 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('raw',{}).get('status',''))" 2>/dev/null || true)
     if [[ "${ddev_status}" == "running" ]]; then
       local php_output
-      php_output=$(ddev exec php /var/www/html/.ddev/secret-vault-helpers/extract-secrets.php \
+      php_output=$(ddev exec php /var/www/html/.ddev/secret-vault/extract-secrets.php \
         "/var/www/html/${php_file}" 2>/dev/null) || php_output=""
       # Only use if it's valid JSON (guards against PHP notices/warnings mixed in)
       if python3 -c "import sys,json; json.loads(sys.stdin.read())" <<< "${php_output}" 2>/dev/null; then
@@ -243,6 +243,35 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
+# Ensure settings*.bak is in .gitignore to prevent leaking secrets
+# ---------------------------------------------------------------------------
+_ensure_gitignore_entry() {
+  local php_file="${1}"
+  local dir
+  dir=$(dirname "${php_file}")
+
+  # Walk up to find the git root (or stop at /)
+  local gitroot="${dir}"
+  while [[ "${gitroot}" != "/" ]]; do
+    if [[ -d "${gitroot}/.git" ]]; then
+      break
+    fi
+    gitroot=$(dirname "${gitroot}")
+  done
+  [[ -d "${gitroot}/.git" ]] || return 0
+
+  local gitignore="${gitroot}/.gitignore"
+  local pattern="settings*.bak"
+
+  if [[ -f "${gitignore}" ]]; then
+    grep -qF "${pattern}" "${gitignore}" && return 0
+  fi
+
+  echo "${pattern}" >> "${gitignore}"
+  ui_dim "  Added '${pattern}' to ${gitignore}"
+}
+
+# ---------------------------------------------------------------------------
 # Clean settings.local.php: replace hardcoded values with getenv() calls
 # ---------------------------------------------------------------------------
 _clean_settings_local() {
@@ -253,6 +282,9 @@ _clean_settings_local() {
   local backup="${php_file}.bak"
   cp "${php_file}" "${backup}"
   ui_dim "  Backup saved: ${backup}"
+
+  # Ensure .bak files are gitignored to prevent secret leaks
+  _ensure_gitignore_entry "${php_file}"
 
   # Generate the cleaned content using Python
   local tmpfile

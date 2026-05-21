@@ -13,14 +13,14 @@ VAULT_FILE="${VAULT_DIR}/test-project.vault"
 mkdir -p "${VAULT_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../secret-vault-helpers/ui.sh"
-source "${SCRIPT_DIR}/../secret-vault-helpers/crypto.sh"
+source "${SCRIPT_DIR}/../secret-vault/ui.sh"
+source "${SCRIPT_DIR}/../secret-vault/crypto.sh"
 
 crypto_get_master_password() { echo "test-password-123"; }
 crypto_load_master_password() { return 1; }
 ui_confirm() { return 0; }
 
-source "${SCRIPT_DIR}/../secret-vault-helpers/import-settings-local.sh"
+source "${SCRIPT_DIR}/../secret-vault/import-settings-local.sh"
 
 # ---------------------------------------------------------------------------
 assert_eq() {

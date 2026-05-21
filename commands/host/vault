@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HELPERS_DIR="${SCRIPT_DIR}/../../secret-vault-helpers"
+HELPERS_DIR="${SCRIPT_DIR}/../../secret-vault"
 
 # Source helpers
 source "${HELPERS_DIR}/ui.sh"
@@ -17,7 +17,7 @@ source "${HELPERS_DIR}/crypto.sh"
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-SECRET_VAULT_VERSION=$(cat "${HELPERS_DIR}/../VERSION" 2>/dev/null | tr -d '[:space:]')
+SECRET_VAULT_VERSION=$(cat "${HELPERS_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]')
 VAULT_DIR="${HOME}/.ddev/secret-vault"
 PROJECT_NAME=""
 VAULT_FILE=""

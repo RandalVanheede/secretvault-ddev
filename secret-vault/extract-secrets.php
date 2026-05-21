@@ -4,7 +4,7 @@
  *
  * PHP-based secret extractor for Drupal settings*.php files.
  * Runs inside the DDEV web container via:
- *   ddev exec php /var/www/html/.ddev/secret-vault-helpers/extract-secrets.php \
+ *   ddev exec php /var/www/html/.ddev/secret-vault/extract-secrets.php \
  *       /var/www/html/web/sites/default/settings.local.php
  *
  * Outputs a JSON object of discovered secrets to stdout.
