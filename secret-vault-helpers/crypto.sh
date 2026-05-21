@@ -131,6 +131,54 @@ crypto_read_password() {
 }
 
 # ---------------------------------------------------------------------------
+# File-based fallback for systems without a keyring (Linux without libsecret).
+# Encrypts master password using a key derived from the machine-id.
+# Less secure than a proper keyring but allows unattended operation.
+# ---------------------------------------------------------------------------
+_VAULT_KEYFILE_DIR="${HOME}/.config/ddev-secret-vault"
+_VAULT_KEYFILE="${_VAULT_KEYFILE_DIR}/keyfile"
+
+_get_machine_key() {
+  # Derive an encryption key from a machine-specific identifier.
+  local machine_id=""
+  if [[ -f /etc/machine-id ]]; then
+    machine_id=$(cat /etc/machine-id)
+  elif [[ -f /var/lib/dbus/machine-id ]]; then
+    machine_id=$(cat /var/lib/dbus/machine-id)
+  else
+    # Fallback: use hostname + uid
+    machine_id="$(hostname)-$(id -u)"
+  fi
+  # Return a derived key (not the raw machine-id)
+  echo -n "ddev-secret-vault:${machine_id}" | openssl dgst -sha256 -binary | base64
+}
+
+_keyfile_load() {
+  [[ -f "${_VAULT_KEYFILE}" ]] || return 1
+  local key
+  key=$(_get_machine_key)
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 \
+    -in "${_VAULT_KEYFILE}" \
+    -pass "pass:${key}" 2>/dev/null
+}
+
+_keyfile_save() {
+  local password="${1}"
+  mkdir -p "${_VAULT_KEYFILE_DIR}"
+  chmod 700 "${_VAULT_KEYFILE_DIR}"
+  local key
+  key=$(_get_machine_key)
+  echo -n "${password}" | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -salt \
+    -out "${_VAULT_KEYFILE}" \
+    -pass "pass:${key}" 2>/dev/null
+  chmod 600 "${_VAULT_KEYFILE}"
+}
+
+_keyfile_delete() {
+  rm -f "${_VAULT_KEYFILE}"
+}
+
+# ---------------------------------------------------------------------------
 # Keychain: load the single master password
 # ---------------------------------------------------------------------------
 crypto_load_master_password() {
@@ -143,6 +191,8 @@ crypto_load_master_password() {
     secret-tool lookup \
       application "${_VAULT_KEYCHAIN_SERVICE}" \
       account "${_VAULT_KEYCHAIN_ACCOUNT}" 2>/dev/null
+  else
+    _keyfile_load 2>/dev/null
   fi
 }
 
@@ -163,6 +213,8 @@ crypto_save_master_password() {
       --label="DDEV Secret Vault (master)" \
       application "${_VAULT_KEYCHAIN_SERVICE}" \
       account "${_VAULT_KEYCHAIN_ACCOUNT}" 2>/dev/null
+  else
+    _keyfile_save "${password}"
   fi
 }
 
@@ -178,6 +230,8 @@ crypto_delete_master_password() {
     secret-tool clear \
       application "${_VAULT_KEYCHAIN_SERVICE}" \
       account "${_VAULT_KEYCHAIN_ACCOUNT}" 2>/dev/null || true
+  else
+    _keyfile_delete
   fi
 }
 
@@ -190,6 +244,7 @@ _keychain_available() {
   elif command -v secret-tool &>/dev/null; then
     true
   else
-    false
+    # File-based fallback is always available on Linux
+    true
   fi
 }

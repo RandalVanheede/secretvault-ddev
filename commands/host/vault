@@ -17,6 +17,7 @@ source "${HELPERS_DIR}/crypto.sh"
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
+SECRET_VAULT_VERSION=$(cat "${HELPERS_DIR}/../VERSION" 2>/dev/null | tr -d '[:space:]')
 VAULT_DIR="${HOME}/.ddev/secret-vault"
 PROJECT_NAME=""
 VAULT_FILE=""
@@ -764,6 +765,7 @@ case "${COMMAND}" in
   ui)              cmd_ui "$@" ;;
   change-password) cmd_change_password "$@" ;;
   help|--help|-h)  cmd_help ;;
+  version|--version|-v) echo "ddev-secret-vault ${SECRET_VAULT_VERSION}" ;;
   *)
     ui_error "Unknown command: ${COMMAND}"
     cmd_help

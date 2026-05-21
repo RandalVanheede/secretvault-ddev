@@ -8,6 +8,8 @@ project_files:
   - secret-vault-helpers/extract-secrets.php
   - secret-vault-helpers/ui.sh
   - secret-vault-helpers/launch-desktop-ui.sh
+  - secret-vault-helpers/update-check.sh
+  - VERSION
 global_files: []
 pre_install_actions: []
 post_install_actions:
