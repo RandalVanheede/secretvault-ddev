@@ -218,6 +218,7 @@ for m in re.finditer(r"""['"]username['"]\s*=>\s*""" + QUOTED, content):
 api_patterns = [
     r"api[_-]?key", r"api[_-]?token", r"secret[_-]?key", r"auth[_-]?token",
     r"access[_-]?token", r"private[_-]?key", r"smtp[_-]?pass",
+    r"[_-]key", r"[_-]token",
     r"stripe[_-]?key", r"sendgrid[_-]?key", r"mailgun[_-]?key",
     r"twilio", r"aws[_-]?secret", r"jwt[_-]?secret",
     r"maps[_-]?api", r"recaptcha", r"google[_-]?api",

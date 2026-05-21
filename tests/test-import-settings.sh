@@ -276,6 +276,21 @@ assert_file_not_contains "Path not replaced with DB_PASSWORD" "${TMPDIR_TEST}/se
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "=== Test 11: Extra sensitive keys ([_-]key, [_-]token) ==="
+cat > "${TMPDIR_TEST}/settings11.php" <<'PHP'
+<?php
+$settings['vat_per_country_key'] = 'secret-vat-key-123';
+$settings['my_app_token'] = 'app-token-456';
+PHP
+
+extracted_json=$(_regex_extract_php_secrets "${TMPDIR_TEST}/settings11.php")
+vat_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('VAT_PER_COUNTRY_KEY',''))")
+token_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('MY_APP_TOKEN',''))")
+assert_eq "vat_per_country_key extracted" "secret-vat-key-123" "${vat_val}"
+assert_eq "my_app_token extracted" "app-token-456" "${token_val}"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "================================"
 echo "  PASSED: ${PASS}"
 echo "  FAILED: ${FAIL}"

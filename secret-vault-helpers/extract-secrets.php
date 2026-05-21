@@ -94,6 +94,8 @@ $sensitive_patterns = [
     '/auth[_\-]?token/i',
     '/access[_\-]?token/i',
     '/private[_\-]?key/i',
+    '/[_\-]key/i',
+    '/[_\-]token/i',
     '/password/i',
     '/passwd/i',
     '/passphrase/i',
