@@ -58,6 +58,18 @@ assert_file_contains() {
   fi
 }
 
+assert_file_not_contains() {
+  local desc="${1}" file="${2}" pattern="${3}"
+  if grep -Eq "${pattern}" "${file}"; then
+    echo "  FAIL: ${desc}"
+    echo "        expected file NOT to match: ${pattern}"
+    (( FAIL++ )) || true
+  else
+    echo "  PASS: ${desc}"
+    (( PASS++ )) || true
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # TEST 1: hash_salt extraction
 echo ""
@@ -214,6 +226,53 @@ PHP
 import_settings_local "${TMPDIR_TEST}/settings8.php" "${VAULT_FILE}" "test-password-123" "true" "stock"
 assert_file_contains "Prefixed hash_salt cleaned" "${TMPDIR_TEST}/settings8.php" "getenv('STOCK__DRUPAL_HASH_SALT')"
 assert_file_contains "Prefixed DB password cleaned" "${TMPDIR_TEST}/settings8.php" "getenv('STOCK__DB_PASSWORD')"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Test 9: Commented code is skipped ==="
+cat > "${TMPDIR_TEST}/settings9.php" <<'PHP'
+<?php
+// $settings['hash_salt'] = 'commented_hash';
+# $databases['default']['default']['password'] = 'commented_pass';
+/* $settings['smtp_password'] = 'commented_smtp'; */
+$settings['hash_salt'] = 'real_hash';
+$databases['default']['default']['password'] = 'real_pass';
+PHP
+
+extracted_json=$(_regex_extract_php_secrets "${TMPDIR_TEST}/settings9.php")
+hash_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('DRUPAL_HASH_SALT',''))")
+db_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('DB_PASSWORD',''))")
+assert_eq "Commented hash_salt skipped" "real_hash" "${hash_val}"
+assert_eq "Commented DB password skipped" "real_pass" "${db_val}"
+# Ensure commented values not extracted
+smtp_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('SMTP_PASSWORD',''))")
+assert_eq "Commented smtp_password skipped" "" "${smtp_val}"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Test 10: No cross-contamination of secrets during clean ==="
+cat > "${TMPDIR_TEST}/settings10.php" <<'PHP'
+<?php
+$settings['hash_salt'] = 'myhash123';
+$settings['file_private_path'] = '/directory/outside/webroot';
+$databases['default']['default'] = [
+  'database' => 'drupal',
+  'username' => 'dbadmin',
+  'password' => 'secretdbpass',
+  'host' => 'localhost',
+];
+PHP
+
+import_settings_local "${TMPDIR_TEST}/settings10.php" "${VAULT_FILE}" "test-password-123" "true" "default"
+
+# Verify the file_private_path was NOT replaced (it's not a secret)
+assert_file_contains "file_private_path unchanged" "${TMPDIR_TEST}/settings10.php" "'/directory/outside/webroot'"
+# Verify DB password was replaced correctly
+assert_file_contains "DB password replaced correctly" "${TMPDIR_TEST}/settings10.php" "getenv('DEFAULT__DB_PASSWORD')"
+# Verify hash_salt was replaced correctly
+assert_file_contains "Hash salt replaced correctly" "${TMPDIR_TEST}/settings10.php" "getenv('DEFAULT__DRUPAL_HASH_SALT')"
+# Verify the path value is NOT getenv('DEFAULT__DB_PASSWORD') or getenv('DEFAULT__DB_USER')
+assert_file_not_contains "Path not replaced with DB_PASSWORD" "${TMPDIR_TEST}/settings10.php" "file_private_path.*getenv"
 
 # ---------------------------------------------------------------------------
 echo ""

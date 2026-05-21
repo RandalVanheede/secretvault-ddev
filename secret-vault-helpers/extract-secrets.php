@@ -2,7 +2,7 @@
 /**
  * extract-secrets.php
  *
- * PHP-based secret extractor for Drupal settings.local.php.
+ * PHP-based secret extractor for Drupal settings*.php files.
  * Runs inside the DDEV web container via:
  *   ddev exec php /var/www/html/.ddev/secret-vault-helpers/extract-secrets.php \
  *       /var/www/html/web/sites/default/settings.local.php

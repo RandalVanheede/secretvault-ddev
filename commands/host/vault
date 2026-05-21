@@ -592,7 +592,7 @@ cmd_import() {
     local settings_files=()
     while IFS= read -r -d '' f; do
       settings_files+=("${f}")
-    done < <(find web/sites docroot/sites sites -path '*/settings.local.php' -type f -print0 2>/dev/null || true)
+    done < <(find web/sites docroot/sites sites -type f -name 'settings*.php' ! -name 'settings.ddev.php' -print0 2>/dev/null || true)
 
     if [[ ${#settings_files[@]} -gt 0 ]]; then
       for candidate in "${settings_files[@]}"; do
@@ -606,7 +606,7 @@ cmd_import() {
     fi
 
     if [[ "${found}" -eq 0 ]]; then
-      ui_warn "No importable files found (.env, settings.local.php)."
+      ui_warn "No importable files found (.env, settings*.php)."
       ui_dim "Use --from=<file> to specify a file explicitly."
     fi
   fi
