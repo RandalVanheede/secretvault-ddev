@@ -14,7 +14,7 @@ A DDEV addon that provides a centralized, encrypted local vault for project secr
 ## Installation
 
 ```bash
-ddev add-on get randalvanheede/ddev-secret-vault
+ddev add-on get RandalVanheede/secretvault-ddev
 ```
 
 ---
