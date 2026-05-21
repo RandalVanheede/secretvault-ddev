@@ -17,7 +17,7 @@ source "${HELPERS_DIR}/crypto.sh"
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-SECRET_VAULT_VERSION=$(cat "${HELPERS_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]')
+SECRET_VAULT_VERSION=$(grep '^version:' "${SCRIPT_DIR}/../../addon-metadata/ddev-secret-vault/manifest.yaml" 2>/dev/null | awk '{print $2}' | tr -d '[:space:]')
 VAULT_DIR="${HOME}/.ddev/secret-vault"
 PROJECT_NAME=""
 VAULT_FILE=""

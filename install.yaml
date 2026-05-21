@@ -9,7 +9,6 @@ project_files:
   - secret-vault/ui.sh
   - secret-vault/launch-desktop-ui.sh
   - secret-vault/update-check.sh
-  - secret-vault/VERSION
 global_files: []
 pre_install_actions: []
 post_install_actions:

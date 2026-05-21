@@ -6,7 +6,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SECRET_VAULT_VERSION=$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]')
+MANIFEST="${SCRIPT_DIR}/../addon-metadata/ddev-secret-vault/manifest.yaml"
+SECRET_VAULT_VERSION=$(grep '^version:' "${MANIFEST}" 2>/dev/null | awk '{print $2}' | tr -d '[:space:]')
 CACHE_DIR="${HOME}/.ddev/secret-vault"
 CACHE_FILE="${CACHE_DIR}/.update_check"
 REPO="RandalVanheede/secretvault-ddev"
