@@ -1,0 +1,772 @@
+#!/usr/bin/env bash
+# #ddev-generated
+## Description: Manage encrypted secrets for this DDEV project
+## Usage: vault [command] [flags]
+## Example: "ddev vault init", "ddev vault set KEY VALUE", "ddev vault list"
+## ExecRaw: true
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HELPERS_DIR="${SCRIPT_DIR}/../../secret-vault-helpers"
+
+# Source helpers
+source "${HELPERS_DIR}/ui.sh"
+source "${HELPERS_DIR}/crypto.sh"
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+VAULT_DIR="${HOME}/.ddev/secret-vault"
+PROJECT_NAME=""
+VAULT_FILE=""
+
+# ---------------------------------------------------------------------------
+# Bootstrap: resolve project name from DDEV context
+# ---------------------------------------------------------------------------
+bootstrap() {
+  if [[ -n "${DDEV_PROJECT:-}" ]]; then
+    PROJECT_NAME="${DDEV_PROJECT}"
+  elif [[ -f ".ddev/config.yaml" ]]; then
+    PROJECT_NAME=$(grep '^name:' .ddev/config.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
+  else
+    ui_error "Not inside a DDEV project directory (no .ddev/config.yaml found)."
+    exit 1
+  fi
+
+  VAULT_FILE="${VAULT_DIR}/${PROJECT_NAME}.vault"
+  mkdir -p "${VAULT_DIR}"
+  chmod 700 "${VAULT_DIR}"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_init() {
+  bootstrap
+  if [[ -f "${VAULT_FILE}" ]]; then
+    ui_warn "Vault already exists for project '${PROJECT_NAME}'."
+    ui_info "Use 'ddev vault status' to inspect it."
+    exit 0
+  fi
+
+  ui_info "Initializing vault for project '${PROJECT_NAME}'..."
+
+  # Use existing master password or create one
+  local password
+  if crypto_load_master_password &>/dev/null; then
+    password=$(crypto_load_master_password)
+    ui_dim "  Using existing master password from keychain."
+  else
+    password=$(crypto_prompt_new_master_password)
+  fi
+
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local json
+  json=$(printf '{"version":1,"project":"%s","created":"%s","updated":"%s","secrets":{},"metadata":{}}' \
+    "${PROJECT_NAME}" "${now}" "${now}")
+
+  crypto_encrypt "${json}" "${VAULT_FILE}" "${password}"
+  _sync_project_path_metadata || true
+
+  _ensure_gitignore
+
+  ui_success "Vault created for project '${PROJECT_NAME}'"
+  ui_dim "  Stored at: ${VAULT_FILE}"
+}
+
+cmd_set() {
+  local key="${1:-}"
+  local value="${2:-}"
+
+  if [[ -z "${key}" || -z "${value}" ]]; then
+    ui_error "Usage: ddev vault set KEY VALUE"
+    exit 1
+  fi
+
+  if ! [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    ui_error "Invalid key '${key}'. Keys must match [A-Za-z_][A-Za-z0-9_]*"
+    exit 1
+  fi
+
+  bootstrap
+  _require_vault
+
+  local password
+  password=$(crypto_get_master_password)
+  local json
+  json=$(crypto_decrypt "${VAULT_FILE}" "${password}")
+
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local json_tmp
+  json_tmp=$(mktemp)
+  echo "${json}" > "${json_tmp}"
+  local updated_json
+  updated_json=$(python3 - "${key}" "${value}" "${now}" "${json_tmp}" <<'PYEOF'
+import sys, json
+key, value, now, json_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(json_file) as f:
+    data = json.loads(f.read())
+data["secrets"][key] = value
+data["metadata"][key] = data["metadata"].get(key, {})
+data["metadata"][key]["updated_at"] = now
+data["updated"] = now
+print(json.dumps(data, indent=2))
+PYEOF
+  )
+  rm -f "${json_tmp}"
+
+  crypto_encrypt "${updated_json}" "${VAULT_FILE}" "${password}"
+  _sync_project_path_metadata || true
+  ui_success "Secret '${key}' stored in vault"
+}
+
+cmd_get() {
+  local key="${1:-}"
+  if [[ -z "${key}" ]]; then
+    ui_error "Usage: ddev vault get KEY"
+    exit 1
+  fi
+
+  bootstrap
+  _require_vault
+
+  local password
+  password=$(crypto_get_master_password)
+  local json
+  json=$(crypto_decrypt "${VAULT_FILE}" "${password}")
+
+  local json_tmp
+  json_tmp=$(mktemp)
+  echo "${json}" > "${json_tmp}"
+  local value
+  value=$(python3 - "${key}" "${json_tmp}" <<'PYEOF'
+import sys, json
+key, json_file = sys.argv[1], sys.argv[2]
+with open(json_file) as f:
+    data = json.loads(f.read())
+val = data["secrets"].get(key)
+if val is None:
+    print(f"ERROR: Secret '{key}' not found", file=sys.stderr)
+    sys.exit(1)
+print(val)
+PYEOF
+  )
+  rm -f "${json_tmp}"
+
+  echo "${value}"
+}
+
+cmd_list() {
+  local show_values=false
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --values|-v) show_values=true; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  bootstrap
+  _require_vault
+
+  local password
+  password=$(crypto_get_master_password)
+  local json
+  json=$(crypto_decrypt "${VAULT_FILE}" "${password}")
+
+  local json_tmp
+  json_tmp=$(mktemp)
+  echo "${json}" > "${json_tmp}"
+  python3 - "${show_values}" "${json_tmp}" <<'PYEOF'
+import sys, json
+show_values = sys.argv[1] == "true"
+with open(sys.argv[2]) as f:
+    data = json.loads(f.read())
+secrets = data.get("secrets", {})
+metadata = data.get("metadata", {})
+
+if not secrets:
+    print("  (no secrets stored)")
+    sys.exit(0)
+
+print(f"  {'KEY':<40} {'SOURCE':<30} {'LAST UPDATED'}")
+print("  " + "-" * 90)
+for key in sorted(secrets.keys()):
+    meta = metadata.get(key, {})
+    source = meta.get("imported_from", "vault set")
+    updated = meta.get("updated_at", meta.get("imported_at", ""))[:19].replace("T", " ")
+    if show_values:
+        val = secrets[key]
+        masked = val if len(val) <= 4 else val[:2] + "*" * (len(val) - 4) + val[-2:]
+        print(f"  {key:<40} {source:<30} {updated}  ({masked})")
+    else:
+        print(f"  {key:<40} {source:<30} {updated}")
+
+print(f"\n  Total: {len(secrets)} secret(s)")
+PYEOF
+  rm -f "${json_tmp}"
+}
+
+cmd_remove() {
+  local key="${1:-}"
+  if [[ -z "${key}" ]]; then
+    ui_error "Usage: ddev vault remove KEY"
+    exit 1
+  fi
+
+  bootstrap
+  _require_vault
+
+  local password
+  password=$(crypto_get_master_password)
+  local json
+  json=$(crypto_decrypt "${VAULT_FILE}" "${password}")
+
+  local json_tmp
+  json_tmp=$(mktemp)
+  echo "${json}" > "${json_tmp}"
+  local updated_json
+  updated_json=$(python3 - "${key}" "${json_tmp}" <<'PYEOF'
+import sys, json
+key, json_file = sys.argv[1], sys.argv[2]
+with open(json_file) as f:
+    data = json.loads(f.read())
+if key not in data["secrets"]:
+    print(f"ERROR: Secret '{key}' not found", file=sys.stderr)
+    sys.exit(1)
+del data["secrets"][key]
+data["metadata"].pop(key, None)
+data["updated"] = (__import__("datetime").datetime.now(__import__("datetime").timezone.utc).replace(tzinfo=None)).strftime("%Y-%m-%dT%H:%M:%SZ")
+print(json.dumps(data, indent=2))
+PYEOF
+  )
+  rm -f "${json_tmp}"
+
+  crypto_encrypt "${updated_json}" "${VAULT_FILE}" "${password}"
+  _sync_project_path_metadata || true
+  ui_success "Secret '${key}' removed from vault"
+}
+
+cmd_inject() {
+  local quiet=false
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --quiet|-q) quiet=true; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  # Resolve project name — must not hard-exit if something is missing
+  if [[ -n "${DDEV_PROJECT:-}" ]]; then
+    PROJECT_NAME="${DDEV_PROJECT}"
+  elif [[ -f ".ddev/config.yaml" ]]; then
+    PROJECT_NAME=$(grep '^name:' .ddev/config.yaml | awk '{print $2}' | tr -d '"' | tr -d "'")
+  else
+    exit 0  # Not a DDEV project dir — silently skip
+  fi
+
+  VAULT_FILE="${VAULT_DIR}/${PROJECT_NAME}.vault"
+
+  if [[ ! -f "${VAULT_FILE}" ]]; then
+    exit 0
+  fi
+
+  local password
+  password=$(crypto_load_master_password 2>/dev/null || true)
+  if [[ -z "${password}" ]]; then
+    if [[ "${quiet}" == true ]]; then
+      # Running as a hook — can't prompt, skip silently
+      exit 0
+    fi
+    # Interactive — prompt and offer to save to keychain
+    password=$(crypto_prompt_new_master_password)
+  fi
+
+  local json
+  if ! json=$(crypto_decrypt "${VAULT_FILE}" "${password}" 2>/dev/null); then
+    if [[ "${quiet}" == false ]]; then
+      ui_warn "Failed to decrypt vault — skipping injection."
+    fi
+    exit 0
+  fi
+
+  local count
+  count=$(python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d['secrets']))" <<< "${json}")
+
+  if [[ "${count}" -eq 0 ]]; then
+    exit 0
+  fi
+
+  local project_root="${DDEV_APPROOT:-${PWD}}"
+  local env_file="${project_root}/.ddev/.env"
+  json_tmp=$(mktemp)
+  echo "${json}" > "${json_tmp}"
+
+  python3 - "${env_file}" "${json_tmp}" <<'PYEOF'
+import sys, json, os, re
+
+env_file = sys.argv[1]
+with open(sys.argv[2]) as f:
+    data = json.loads(f.read())
+secrets = data.get("secrets", {})
+
+MARKER_START = "# --- secret-vault: BEGIN ---"
+MARKER_END   = "# --- secret-vault: END ---"
+
+existing_lines = []
+if os.path.exists(env_file):
+    with open(env_file) as f:
+        content = f.read()
+    content = re.sub(
+        r'# --- secret-vault: BEGIN ---.*?# --- secret-vault: END ---\n?',
+        '', content, flags=re.DOTALL
+    )
+    existing_lines = content.rstrip("\n").split("\n") if content.strip() else []
+
+vault_lines = [MARKER_START]
+for k, v in sorted(secrets.items()):
+    safe_v = v.replace('"', '\\"')
+    vault_lines.append(f'{k}="{safe_v}"')
+vault_lines.append(MARKER_END)
+
+final_lines = existing_lines + [""] + vault_lines if existing_lines else vault_lines
+output = "\n".join(final_lines) + "\n"
+
+os.makedirs(os.path.dirname(env_file), exist_ok=True)
+with open(env_file, "w") as f:
+    f.write(output)
+PYEOF
+  rm -f "${json_tmp}"
+
+  if [[ "${quiet}" == false ]]; then
+    ui_success "Injected ${count} secret(s) from vault into .ddev/.env"
+  fi
+}
+
+cmd_clean() {
+  # Remove the secret-vault block from .ddev/.env on stop/poweroff.
+  # NOTE: intentionally does NOT call bootstrap — must work even if no vault exists.
+  local quiet=false
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --quiet|-q) quiet=true; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  local project_root="${DDEV_APPROOT:-${PWD}}"
+  local env_file="${project_root}/.ddev/.env"
+
+  if [[ ! -f "${env_file}" ]]; then
+    exit 0
+  fi
+
+  if ! grep -q "secret-vault: BEGIN" "${env_file}" 2>/dev/null; then
+    exit 0
+  fi
+
+  python3 - "${env_file}" <<'PYEOF'
+import sys, re, os
+
+env_file = sys.argv[1]
+with open(env_file) as f:
+    content = f.read()
+
+cleaned = re.sub(
+    r'\n?# --- secret-vault: BEGIN ---.*?# --- secret-vault: END ---\n?',
+    '', content, flags=re.DOTALL
+).strip()
+
+if cleaned:
+    with open(env_file, "w") as f:
+        f.write(cleaned + "\n")
+else:
+    os.remove(env_file)
+PYEOF
+
+  if [[ "${quiet}" == false ]]; then
+    ui_success "Removed secrets from .ddev/.env"
+  fi
+}
+
+cmd_status() {
+  bootstrap
+
+  ui_header "Vault Status: ${PROJECT_NAME}"
+
+  if [[ ! -f "${VAULT_FILE}" ]]; then
+    ui_warn "No vault found. Run 'ddev vault init' to create one."
+    exit 0
+  fi
+
+  ui_dim "  Vault file:  ${VAULT_FILE}"
+  local size
+  size=$(du -h "${VAULT_FILE}" | cut -f1)
+  ui_dim "  File size:   ${size}"
+
+  # Check keychain
+  if crypto_load_master_password &>/dev/null; then
+    ui_dim "  Keychain:    Master password stored"
+  else
+    ui_warn "  Keychain:    No master password in keychain — will prompt on each use"
+  fi
+
+  local password
+  password=$(crypto_get_master_password)
+  local json
+  if ! json=$(crypto_decrypt "${VAULT_FILE}" "${password}" 2>/dev/null); then
+    ui_error "Failed to decrypt vault — wrong password?"
+    exit 1
+  fi
+
+  local status_tmp
+  status_tmp=$(mktemp)
+  echo "${json}" > "${status_tmp}"
+  python3 - "${status_tmp}" <<'PYEOF'
+import sys, json
+with open(sys.argv[1]) as f:
+    data = json.loads(f.read())
+secrets = data.get("secrets", {})
+print(f"  Project:     {data.get('project','?')}")
+print(f"  Created:     {data.get('created','?')[:19].replace('T',' ')}")
+print(f"  Updated:     {data.get('updated','?')[:19].replace('T',' ')}")
+print(f"  Secrets:     {len(secrets)}")
+if secrets:
+    print(f"  Keys:        {', '.join(sorted(secrets.keys()))}")
+PYEOF
+  rm -f "${status_tmp}"
+
+  local env_file="${DDEV_APPROOT:-${PWD}}/.ddev/.env"
+  if [[ -f "${env_file}" ]] && grep -q "secret-vault: BEGIN" "${env_file}" 2>/dev/null; then
+    ui_success "  Injected:    Yes (.ddev/.env contains vault block)"
+  else
+    ui_warn "  Injected:    No (run 'ddev vault inject' or 'ddev start')"
+  fi
+}
+
+cmd_export() {
+  local outfile="${1:-}"
+
+  bootstrap
+  _require_vault
+
+  local password
+  password=$(crypto_get_master_password)
+  local json
+  json=$(crypto_decrypt "${VAULT_FILE}" "${password}")
+
+  local export_tmp
+  export_tmp=$(mktemp)
+  echo "${json}" > "${export_tmp}"
+
+  local export_content
+  export_content=$(python3 - "${export_tmp}" <<'PYEOF'
+import sys, json, datetime
+with open(sys.argv[1]) as f:
+    data = json.loads(f.read())
+secrets = data.get("secrets", {})
+lines = [
+    f"# secret-vault export — project: {data.get('project','?')}",
+    f"# exported: {datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+    f"# secrets: {len(secrets)}",
+    "",
+]
+for k, v in sorted(secrets.items()):
+    safe_v = v.replace('"', '\\"')
+    lines.append(f'{k}="{safe_v}"')
+print("\n".join(lines))
+PYEOF
+  )
+  local secret_count
+  secret_count=$(python3 -c "import json; d=json.load(open('${export_tmp}')); print(len(d['secrets']))")
+  rm -f "${export_tmp}"
+
+  if [[ -n "${outfile}" ]]; then
+    echo "${export_content}" > "${outfile}"
+    ui_success "Exported ${secret_count} secret(s) to ${outfile}"
+  else
+    echo "${export_content}"
+  fi
+}
+
+cmd_change_password() {
+  bootstrap
+  _require_vault
+
+  ui_info "Changing master vault password..."
+  local old_password
+  old_password=$(crypto_read_password "Current master password")
+
+  # Verify it works against this vault
+  if ! crypto_decrypt "${VAULT_FILE}" "${old_password}" &>/dev/null; then
+    ui_error "Incorrect password."
+    exit 1
+  fi
+
+  # Find ALL vaults and re-encrypt them
+  local vault_files=()
+  while IFS= read -r -d '' f; do
+    vault_files+=("${f}")
+  done < <(find "${VAULT_DIR}" -name "*.vault" -print0 2>/dev/null)
+
+  if [[ ${#vault_files[@]} -gt 1 ]]; then
+    ui_info "This will re-encrypt ${#vault_files[@]} vault(s) with the new password."
+  fi
+
+  local new_password
+  new_password=$(crypto_prompt_new_master_password)
+
+  local failed=0
+  for vf in "${vault_files[@]}"; do
+    local vname
+    vname=$(basename "${vf}" .vault)
+    local vjson
+    if vjson=$(crypto_decrypt "${vf}" "${old_password}" 2>/dev/null); then
+      cp "${vf}" "${vf}.bak"
+      crypto_encrypt "${vjson}" "${vf}" "${new_password}"
+      rm -f "${vf}.bak"
+      ui_dim "  Re-encrypted: ${vname}"
+    else
+      ui_warn "  Skipped (different password?): ${vname}"
+      (( failed++ )) || true
+    fi
+  done
+
+  crypto_save_master_password "${new_password}"
+
+  if [[ "${failed}" -gt 0 ]]; then
+    ui_warn "Password changed, but ${failed} vault(s) could not be re-encrypted (they may use a different password)."
+  else
+    ui_success "Master password changed and all vaults re-encrypted."
+  fi
+}
+
+cmd_import() {
+  local from_file=""
+  local clean=false
+  export ASSUME_YES=false
+
+  while [[ $# -gt 0 ]]; do
+    case "${1}" in
+      --from=*) from_file="${1#--from=}"; shift ;;
+      --from)   from_file="${2}"; shift 2 ;;
+      --clean)  clean=true; shift ;;
+      -y|--yes) export ASSUME_YES=true; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  bootstrap
+  _require_vault
+
+  local password
+  password=$(crypto_get_master_password)
+  # Validate password by decrypting
+  crypto_decrypt "${VAULT_FILE}" "${password}" > /dev/null
+
+  source "${HELPERS_DIR}/import-env.sh"
+  source "${HELPERS_DIR}/import-settings-local.sh"
+
+  if [[ -n "${from_file}" ]]; then
+    case "${from_file}" in
+      *.php)
+        local subsite_name
+        subsite_name=$(basename "$(dirname "${from_file}")")
+        import_settings_local "${from_file}" "${VAULT_FILE}" "${password}" "${clean}" "${subsite_name}"
+        ;;
+      *)     import_env_file "${from_file}" "${VAULT_FILE}" "${password}" "${clean}" ;;
+    esac
+  else
+    local found=0
+
+    if [[ -f ".env" ]]; then
+      ui_info "Found .env"
+      import_env_file ".env" "${VAULT_FILE}" "${password}" "${clean}"
+      (( found++ )) || true
+    fi
+
+    local settings_files=()
+    while IFS= read -r -d '' f; do
+      settings_files+=("${f}")
+    done < <(find web/sites docroot/sites sites -path '*/settings.local.php' -type f -print0 2>/dev/null || true)
+
+    if [[ ${#settings_files[@]} -gt 0 ]]; then
+      for candidate in "${settings_files[@]}"; do
+        [[ -f "${candidate}" ]] || continue
+        local subsite_name
+        subsite_name=$(basename "$(dirname "${candidate}")")
+        ui_info "Found ${candidate} (subsite: ${subsite_name})"
+        import_settings_local "${candidate}" "${VAULT_FILE}" "${password}" "${clean}" "${subsite_name}"
+        (( found++ )) || true
+      done
+    fi
+
+    if [[ "${found}" -eq 0 ]]; then
+      ui_warn "No importable files found (.env, settings.local.php)."
+      ui_dim "Use --from=<file> to specify a file explicitly."
+    fi
+  fi
+
+  _sync_project_path_metadata || true
+}
+
+cmd_ui() {
+  bootstrap
+  _require_vault
+
+  if _launch_desktop_ui; then
+    exit 0
+  fi
+
+  ui_error "Could not launch Secret Vault Desktop."
+  ui_dim "Please ensure the app is installed or built locally."
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_require_vault() {
+  if [[ ! -f "${VAULT_FILE}" ]]; then
+    ui_error "No vault found for project '${PROJECT_NAME}'."
+    ui_info "Run 'ddev vault init' to create one."
+    exit 1
+  fi
+}
+
+_launch_desktop_ui() {
+  local helper_script="${HELPERS_DIR}/launch-desktop-ui.sh"
+  [[ -f "${helper_script}" ]] || return 1
+
+  if bash "${helper_script}" "${PROJECT_NAME}"; then
+    ui_success "Opened Secret Vault desktop app"
+    return 0
+  fi
+
+  ui_warn "Desktop app unavailable"
+  return 1
+}
+
+_sync_project_path_metadata() {
+  [[ -f "${VAULT_FILE}" ]] || return 0
+
+  local project_root="${DDEV_APPROOT:-${PWD}}"
+  [[ -d "${project_root}/.ddev" ]] || return 0
+
+  local password
+  password=$(crypto_load_master_password 2>/dev/null || true)
+  if [[ -z "${password}" ]]; then
+    password=$(crypto_get_master_password)
+  fi
+
+  local json
+  json=$(crypto_decrypt "${VAULT_FILE}" "${password}")
+
+  local json_tmp
+  json_tmp=$(mktemp)
+  echo "${json}" > "${json_tmp}"
+  local updated_json
+  updated_json=$(python3 - "${project_root}" "${json_tmp}" <<'PYEOF'
+import sys, json
+
+project_root = sys.argv[1]
+json_file = sys.argv[2]
+
+with open(json_file) as f:
+    data = json.loads(f.read())
+
+metadata = data.setdefault("metadata", {})
+vault_meta = metadata.setdefault("vault", {})
+vault_meta["project_path"] = project_root
+
+print(json.dumps(data, indent=2))
+PYEOF
+  )
+  rm -f "${json_tmp}"
+
+  crypto_encrypt "${updated_json}" "${VAULT_FILE}" "${password}"
+}
+
+_ensure_gitignore() {
+  local gitignore_candidates=(".gitignore" "../.gitignore")
+  local gitignore_file=""
+
+  for f in "${gitignore_candidates[@]}"; do
+    if [[ -f "${f}" ]]; then
+      gitignore_file="${f}"
+      break
+    fi
+  done
+
+  [[ -z "${gitignore_file}" ]] && return
+
+  if ! grep -qE '^\s*\.ddev/\.env\s*$' "${gitignore_file}" 2>/dev/null; then
+    echo ".ddev/.env" >> "${gitignore_file}"
+    ui_dim "  Added .ddev/.env to ${gitignore_file}"
+  fi
+
+  if ! grep -qE '^\s*\.ddev/\.env\.\*\s*$' "${gitignore_file}" 2>/dev/null; then
+    echo ".ddev/.env.*" >> "${gitignore_file}"
+    ui_dim "  Added .ddev/.env.* to ${gitignore_file}"
+  fi
+}
+
+cmd_help() {
+  cat <<'HELP'
+
+  ddev vault — encrypted secret management for DDEV projects
+
+  CORE COMMANDS
+    init                     Initialize a vault for this project
+    set KEY VALUE            Store a secret
+    get KEY                  Retrieve a secret value
+    list [--values]          List all secret keys (use --values to show masked values)
+    remove KEY               Delete a secret
+    inject [--quiet]         Write secrets to .ddev/.env (runs automatically on ddev start)
+    clean  [--quiet]         Remove secrets from .ddev/.env (runs automatically on ddev stop)
+
+  IMPORT COMMANDS
+    import                   Auto-detect and import secrets from .env / settings.local.php
+    import --from=FILE       Import from a specific file
+    import --clean           Import AND sanitize source files (creates .bak backup)
+
+  UTILITY COMMANDS
+    ui                       Open the desktop application
+    export [FILE]            Export vault as .env format (stdout or file)
+    status                   Show vault info and injection status
+    change-password          Change the master password (re-encrypts all vaults)
+    help                     Show this help
+
+HELP
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+COMMAND="${1:-help}"
+shift || true
+
+case "${COMMAND}" in
+  init)            cmd_init "$@" ;;
+  set)             cmd_set "$@" ;;
+  get)             cmd_get "$@" ;;
+  list|ls)         cmd_list "$@" ;;
+  remove|rm|del)   cmd_remove "$@" ;;
+  inject)          cmd_inject "$@" ;;
+  clean)           cmd_clean "$@" ;;
+  import)          cmd_import "$@" ;;
+  export)          cmd_export "$@" ;;
+  status)          cmd_status "$@" ;;
+  ui)              cmd_ui "$@" ;;
+  change-password) cmd_change_password "$@" ;;
+  help|--help|-h)  cmd_help ;;
+  *)
+    ui_error "Unknown command: ${COMMAND}"
+    cmd_help
+    exit 1
+    ;;
+esac

@@ -1,0 +1,15 @@
+name: ddev-secret-vault
+project_files:
+  - config.secret-vault.yaml
+  - commands/host/vault
+  - secret-vault-helpers/crypto.sh
+  - secret-vault-helpers/import-env.sh
+  - secret-vault-helpers/import-settings-local.sh
+  - secret-vault-helpers/extract-secrets.php
+  - secret-vault-helpers/ui.sh
+  - secret-vault-helpers/launch-desktop-ui.sh
+global_files: []
+pre_install_actions: []
+post_install_actions:
+  - echo "Secret Vault installed! Run 'ddev vault init' to get started."
+yaml_read_files: {}

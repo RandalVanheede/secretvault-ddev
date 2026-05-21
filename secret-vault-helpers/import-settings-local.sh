@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# #ddev-generated
+# import-settings-local.sh — Import secrets from Drupal settings.local.php
+
+# ---------------------------------------------------------------------------
+# Import secrets from settings.local.php
+# Usage: import_settings_local <php_file> <vault_file> <password> <clean:bool>
+# ---------------------------------------------------------------------------
+import_settings_local() {
+  local php_file="${1}"
+  local vault_file="${2}"
+  local password="${3}"
+  local clean="${4:-false}"
+  local subsite_prefix="${5:-}"
+
+  if [[ ! -f "${php_file}" ]]; then
+    ui_error "File not found: ${php_file}"
+    return 1
+  fi
+
+  ui_info "Extracting secrets from ${php_file}..."
+
+  # Try PHP extraction via DDEV container first; fall back to regex.
+  # Guard: only attempt if DDEV is actually running (containers up).
+  local extracted_json=""
+
+  if command -v ddev &>/dev/null; then
+    local ddev_status
+    ddev_status=$(ddev describe -j 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('raw',{}).get('status',''))" 2>/dev/null || true)
+    if [[ "${ddev_status}" == "running" ]]; then
+      local php_output
+      php_output=$(ddev exec php /var/www/html/.ddev/secret-vault-helpers/extract-secrets.php \
+        "/var/www/html/${php_file}" 2>/dev/null) || php_output=""
+      # Only use if it's valid JSON (guards against PHP notices/warnings mixed in)
+      if python3 -c "import sys,json; json.loads(sys.stdin.read())" <<< "${php_output}" 2>/dev/null; then
+        extracted_json="${php_output}"
+      fi
+    fi
+  fi
+
+  # Fall back to pure-Python regex extraction
+  if [[ -z "${extracted_json}" ]] || [[ "${extracted_json}" == "{}" ]]; then
+    extracted_json=$(_regex_extract_php_secrets "${php_file}")
+  fi
+
+  # Final validation — ensure we have parseable JSON
+  if ! python3 -c "import sys,json; json.loads(sys.stdin.read())" <<< "${extracted_json}" 2>/dev/null; then
+    ui_error "Secret extraction produced invalid output. Try running with bash -x for details."
+    return 1
+  fi
+
+  # Check if anything was actually found
+  local count
+  count=$(python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d))" <<< "${extracted_json}")
+  if [[ "${count}" -eq 0 ]]; then
+    ui_warn "No recognizable secrets found in ${php_file}"
+    return 0
+  fi
+
+  # Namespace keys per subsite when requested.
+  if [[ -n "${subsite_prefix}" ]]; then
+    local prefix_tmp
+    prefix_tmp=$(mktemp)
+    echo "${extracted_json}" > "${prefix_tmp}"
+    extracted_json=$(python3 - "${subsite_prefix}" "${prefix_tmp}" <<'PYEOF'
+import sys, json, re
+prefix = re.sub(r'[^A-Z0-9]', '_', sys.argv[1].upper())
+with open(sys.argv[2]) as f:
+    data = json.loads(f.read())
+print(json.dumps({f"{prefix}__{k}": v for k, v in data.items()}, indent=2))
+PYEOF
+    )
+    rm -f "${prefix_tmp}"
+    count=$(python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d))" <<< "${extracted_json}")
+  fi
+
+  # Display what was found
+  count=$(python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d))" <<< "${extracted_json}")
+  ui_info "Found ${count} secret(s):"
+
+  python3 -c "
+import sys, json
+data = json.loads(sys.stdin.read())
+for k, v in sorted(data.items()):
+    mv = v if len(v) <= 4 else v[:2] + '*' * (len(v)-4) + v[-2:]
+    print(f'    {k} = {mv}', file=sys.stderr)
+" <<< "${extracted_json}"
+
+  if ! ui_confirm "Import all into vault?"; then
+    ui_info "Import cancelled."
+    return 0
+  fi
+
+  # Load current vault JSON
+  local json
+  json=$(crypto_decrypt "${vault_file}" "${password}")
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  local source_basename
+  source_basename=$(basename "${php_file}")
+
+  local updated_json
+  local extracted_tmp json_tmp
+  extracted_tmp=$(mktemp)
+  json_tmp=$(mktemp)
+  echo "${extracted_json}" > "${extracted_tmp}"
+  echo "${json}" > "${json_tmp}"
+
+  updated_json=$(python3 - "${now}" "${source_basename}" "${extracted_tmp}" "${json_tmp}" <<'PYEOF'
+import sys, json
+
+now = sys.argv[1]
+source = sys.argv[2]
+extracted_file = sys.argv[3]
+vault_file = sys.argv[4]
+
+with open(extracted_file) as f:
+    extracted = json.loads(f.read())
+with open(vault_file) as f:
+    vault_data = json.loads(f.read())
+
+for key, value in extracted.items():
+    vault_data["secrets"][key] = value
+    vault_data["metadata"][key] = {
+        "imported_from": source,
+        "imported_at": now,
+        "updated_at": now
+    }
+
+vault_data["updated"] = now
+print(json.dumps(vault_data, indent=2))
+PYEOF
+  )
+  rm -f "${extracted_tmp}" "${json_tmp}"
+
+  crypto_encrypt "${updated_json}" "${vault_file}" "${password}"
+  ui_success "Imported ${count} secret(s) from ${php_file} into vault"
+
+  if [[ "${clean}" == "true" ]]; then
+    _clean_settings_local "${php_file}" "${extracted_json}" "${subsite_prefix}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Regex-based PHP secret extraction (no PHP runtime needed)
+# Outputs JSON object: {"KEY": "value", ...}
+# ---------------------------------------------------------------------------
+_regex_extract_php_secrets() {
+  local php_file="${1}"
+
+  python3 - "${php_file}" <<'PYEOF'
+import sys, re, json
+
+php_file = sys.argv[1]
+with open(php_file) as f:
+    content = f.read()
+
+secrets = {}
+
+# Pattern helpers
+QUOTED = r"""(?:'([^']*)'|"([^"]*)")"""
+
+def first_group(*groups):
+    return next((g for g in groups if g is not None), None)
+
+# $settings['hash_salt'] = '...'
+for m in re.finditer(r"""\$settings\s*\[\s*'hash_salt'\s*\]\s*=\s*""" + QUOTED, content):
+    secrets["DRUPAL_HASH_SALT"] = first_group(m.group(1), m.group(2))
+
+# $settings['hash_salt'] = $settings['hash_salt'] ?? '...'
+for m in re.finditer(
+    r"""\$settings\s*\[\s*'hash_salt'\s*\]\s*=\s*\$settings\s*\[\s*'hash_salt'\s*\]\s*\?\?\s*""" + QUOTED,
+    content,
+):
+    secrets["DRUPAL_HASH_SALT"] = first_group(m.group(1), m.group(2))
+
+# $databases['default']['default']['password']  = '...'
+for m in re.finditer(r"""\$databases\s*\[.*?\]\s*\[.*?\]\s*\[.*?'password'.*?\]\s*=\s*""" + QUOTED, content, re.DOTALL):
+    secrets["DB_PASSWORD"] = first_group(m.group(1), m.group(2))
+
+# $databases[...]['default']['username'] = '...'
+for m in re.finditer(r"""\$databases\s*\[.*?\]\s*\[.*?\]\s*\[.*?'username'.*?\]\s*=\s*""" + QUOTED, content, re.DOTALL):
+    val = first_group(m.group(1), m.group(2))
+    if val and val not in ("db", "root", "drupal"):
+        secrets["DB_USER"] = val
+
+# Array-style: 'password' => '...'
+for m in re.finditer(r"""['"]password['"]\s*=>\s*""" + QUOTED, content):
+    if "DB_PASSWORD" not in secrets:
+        val = first_group(m.group(1), m.group(2))
+        if val and val not in ("db", "root", "drupal", ""):
+            secrets["DB_PASSWORD"] = val
+
+# Generic API/token patterns: $config['key'] = '...' or $settings['key'] = '...'
+api_patterns = [
+    r"api[_-]?key", r"api[_-]?token", r"secret[_-]?key", r"auth[_-]?token",
+    r"access[_-]?token", r"private[_-]?key", r"smtp[_-]?pass",
+    r"stripe[_-]?key", r"sendgrid[_-]?key", r"mailgun[_-]?key",
+    r"twilio", r"aws[_-]?secret", r"jwt[_-]?secret",
+    r"maps[_-]?api", r"recaptcha", r"google[_-]?api",
+]
+combined_api = "(" + "|".join(api_patterns) + ")"
+
+for m in re.finditer(
+    r"""\$(?:settings|config)\s*\[\s*['"]([^'"]*""" + combined_api + r"""[^'"]*)['"]\s*\]\s*=\s*""" + QUOTED,
+    content, re.IGNORECASE
+):
+    cfg_key = m.group(1)
+    val = first_group(m.group(len(m.groups())-1), m.group(len(m.groups())))
+    if val:
+        env_key = re.sub(r'[^A-Z0-9]', '_', cfg_key.upper())
+        secrets[env_key] = val
+
+# Remove empty values
+secrets = {k: v for k, v in secrets.items() if v}
+
+print(json.dumps(secrets, indent=2))
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
+# Clean settings.local.php: replace hardcoded values with getenv() calls
+# ---------------------------------------------------------------------------
+_clean_settings_local() {
+  local php_file="${1}"
+  local extracted_json="${2}"
+  local subsite_prefix="${3:-}"
+
+  local backup="${php_file}.bak"
+  cp "${php_file}" "${backup}"
+  ui_dim "  Backup saved: ${backup}"
+
+  # Generate the cleaned content using Python
+  local tmpfile
+  tmpfile=$(mktemp)
+
+  local extracted_tmp
+  extracted_tmp=$(mktemp)
+  echo "${extracted_json}" > "${extracted_tmp}"
+
+  python3 - "${php_file}" "${extracted_tmp}" <<'PYEOF' > "${tmpfile}"
+import sys, re, json, difflib
+
+php_file = sys.argv[1]
+with open(sys.argv[2]) as f:
+    extracted = json.loads(f.read())
+
+with open(php_file) as f:
+    original = f.read()
+
+cleaned = original
+QUOTED_VAL = r"""(?:'[^']*'|"[^"]*")"""
+
+def canonical_key(env_key):
+    if "__" in env_key:
+        return env_key.split("__", 1)[1]
+    return env_key
+
+canonical = {canonical_key(k): (k, v) for k, v in extracted.items()}
+
+def replace_exact_assignment(text, target, replacement):
+    # Replace quoted exact values only when they are assigned in PHP code,
+    # not inside comments or existing getenv() expressions.
+    escaped = re.escape(target)
+    return re.sub(
+        r"""(=\s*)['\"]""" + escaped + r"""['\"]""",
+        r"\1" + replacement,
+        text,
+    )
+
+def replace_exact_array_value(text, target, replacement):
+    escaped = re.escape(target)
+    return re.sub(
+        r"""(=>\s*)['\"]""" + escaped + r"""['\"]""",
+        r"\1" + replacement,
+        text,
+    )
+
+# Replace $settings['hash_salt'] = '...';
+if "DRUPAL_HASH_SALT" in canonical:
+    env_key, env_value = canonical["DRUPAL_HASH_SALT"]
+    cleaned = re.sub(
+        r"""(\$settings\s*\[\s*'hash_salt'\s*\]\s*=\s*)""" + QUOTED_VAL,
+        rf"\1getenv('{env_key}')",
+        cleaned
+    )
+
+    # Replace null-coalescing fallback style:
+    # $settings['hash_salt'] = $settings['hash_salt'] ?? 'secret';
+    cleaned = re.sub(
+        r"""(\$settings\s*\[\s*'hash_salt'\s*\]\s*=\s*\$settings\s*\[\s*'hash_salt'\s*\]\s*\?\?\s*)""" + QUOTED_VAL,
+        rf"\1getenv('{env_key}')",
+        cleaned
+    )
+
+    # Replace exact remaining occurrences assigned to hash_salt.
+    cleaned = replace_exact_assignment(cleaned, env_value, f"getenv('{env_key}')")
+    cleaned = replace_exact_array_value(cleaned, env_value, f"getenv('{env_key}')")
+
+# Replace 'password' => '...' in $databases
+if "DB_PASSWORD" in canonical:
+    env_key, env_value = canonical["DB_PASSWORD"]
+    cleaned = re.sub(
+        r"""(['"]password['"]\s*=>\s*)""" + QUOTED_VAL,
+        rf"\1getenv('{env_key}')",
+        cleaned
+    )
+
+# Replace $databases[...]['password'] = '...'
+if "DB_PASSWORD" in canonical:
+    cleaned = re.sub(
+        r"""(\$databases[^;]*?'password'[^;]*?=\s*)""" + QUOTED_VAL,
+        rf"\1getenv('{env_key}')",
+        cleaned,
+        flags=re.DOTALL
+    )
+
+    # Replace any exact remaining DB password values in assignment contexts.
+    cleaned = replace_exact_assignment(cleaned, env_value, f"getenv('{env_key}')")
+    cleaned = replace_exact_array_value(cleaned, env_value, f"getenv('{env_key}')")
+
+# Generic: replace other extracted values
+for env_key, secret_val in extracted.items():
+    if canonical_key(env_key) in ("DRUPAL_HASH_SALT", "DB_PASSWORD"):
+        continue
+    if not secret_val:
+        continue
+    cleaned = replace_exact_assignment(cleaned, secret_val, f"getenv('{env_key}')")
+    cleaned = replace_exact_array_value(cleaned, secret_val, f"getenv('{env_key}')")
+
+# Show diff
+orig_lines = original.splitlines(keepends=True)
+clean_lines = cleaned.splitlines(keepends=True)
+diff = list(difflib.unified_diff(orig_lines, clean_lines, fromfile=php_file, tofile=php_file + " (cleaned)"))
+print("".join(diff), end="")
+
+# Write cleaned content as second output separated by a sentinel
+print("\n###CLEANED_CONTENT###\n")
+print(cleaned, end="")
+PYEOF
+
+  if [[ ! -s "${tmpfile}" ]]; then
+    ui_dim "  No changes needed."
+    rm -f "${tmpfile}"
+    rm -f "${extracted_tmp}"
+    return 0
+  fi
+
+  # Split diff from cleaned content
+  local sentinel="###CLEANED_CONTENT###"
+  local diff_content
+  diff_content=$(sed "/${sentinel}/,\$d" "${tmpfile}")
+  local cleaned_content
+  cleaned_content=$(sed "1,/${sentinel}/d" "${tmpfile}")
+
+  ui_header "Preview changes to ${php_file}"
+  while IFS= read -r line; do
+    ui_diff_line "${line}"
+  done <<< "${diff_content}"
+
+  rm -f "${tmpfile}" "${extracted_tmp}"
+
+  if ui_confirm "Apply these changes?"; then
+    echo "${cleaned_content}" > "${php_file}"
+    ui_success "Cleaned ${php_file}"
+  else
+    ui_info "Changes not applied. Backup preserved at ${backup}"
+  fi
+}
