@@ -5,17 +5,26 @@
  * PHP-based secret extractor for Drupal settings*.php files.
  * Runs inside the DDEV web container via:
  *   ddev exec php /var/www/html/.ddev/secret-vault/extract-secrets.php \
- *       /var/www/html/web/sites/default/settings.local.php
+ *       /var/www/html/web/sites/default/settings.local.php [--skip-hash-salt]
  *
  * Outputs a JSON object of discovered secrets to stdout.
  */
 
-if (empty($argv[1])) {
-    fwrite(STDERR, "Usage: extract-secrets.php <path-to-settings.local.php>\n");
-    exit(1);
+$skip_hash_salt = false;
+$file = null;
+
+foreach (array_slice($argv, 1) as $arg) {
+    if ($arg === '--skip-hash-salt') {
+        $skip_hash_salt = true;
+    } elseif ($file === null) {
+        $file = $arg;
+    }
 }
 
-$file = $argv[1];
+if (empty($file)) {
+    fwrite(STDERR, "Usage: extract-secrets.php <path-to-settings.local.php> [--skip-hash-salt]\n");
+    exit(1);
+}
 
 if (!file_exists($file)) {
     fwrite(STDERR, "File not found: {$file}\n");
@@ -40,7 +49,7 @@ $config    = [];
 $secrets = [];
 
 // Drupal hash salt
-if (!empty($settings['hash_salt'])) {
+if (!$skip_hash_salt && !empty($settings['hash_salt'])) {
     $secrets['DRUPAL_HASH_SALT'] = (string) $settings['hash_salt'];
 }
 

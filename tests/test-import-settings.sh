@@ -291,6 +291,45 @@ assert_eq "my_app_token extracted" "app-token-456" "${token_val}"
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "=== Test 12: --skip-hash-salt omits DRUPAL_HASH_SALT from extraction ==="
+cat > "${TMPDIR_TEST}/settings12.php" <<'PHP'
+<?php
+$settings['hash_salt'] = 'skipped-hash-value';
+$databases['default']['default'] = ['password' => 'keep-this-pass', 'driver' => 'mysql'];
+PHP
+
+extracted_json=$(_regex_extract_php_secrets "${TMPDIR_TEST}/settings12.php" "true")
+hash_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('DRUPAL_HASH_SALT','NOT_FOUND'))")
+db_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('DB_PASSWORD','NOT_FOUND'))")
+assert_eq "DRUPAL_HASH_SALT skipped when flag=true" "NOT_FOUND" "${hash_val}"
+assert_eq "DB_PASSWORD still extracted when skip-hash-salt=true" "keep-this-pass" "${db_val}"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Test 13: skip-hash-salt=false still extracts DRUPAL_HASH_SALT ==="
+cat > "${TMPDIR_TEST}/settings13.php" <<'PHP'
+<?php
+$settings['hash_salt'] = 'should-be-extracted';
+PHP
+
+extracted_json=$(_regex_extract_php_secrets "${TMPDIR_TEST}/settings13.php" "false")
+hash_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('DRUPAL_HASH_SALT','NOT_FOUND'))")
+assert_eq "DRUPAL_HASH_SALT extracted when flag=false" "should-be-extracted" "${hash_val}"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Test 14: skip-hash-salt null-coalescing form is also skipped ==="
+cat > "${TMPDIR_TEST}/settings14.php" <<'PHP'
+<?php
+$settings['hash_salt'] = $settings['hash_salt'] ?? 'fallback-hash-skip';
+PHP
+
+extracted_json=$(_regex_extract_php_secrets "${TMPDIR_TEST}/settings14.php" "true")
+hash_val=$(echo "${extracted_json}" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('DRUPAL_HASH_SALT','NOT_FOUND'))")
+assert_eq "Null-coalescing hash_salt skipped when flag=true" "NOT_FOUND" "${hash_val}"
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "================================"
 echo "  PASSED: ${PASS}"
 echo "  FAILED: ${FAIL}"

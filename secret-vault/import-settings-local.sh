@@ -5,7 +5,7 @@
 
 # ---------------------------------------------------------------------------
 # Import secrets from settings*.php files
-# Usage: import_settings_local <php_file> <vault_file> <password> <clean:bool>
+# Usage: import_settings_local <php_file> <vault_file> <password> <clean:bool> [subsite_prefix] [skip_hash_salt:bool]
 # ---------------------------------------------------------------------------
 import_settings_local() {
   local php_file="${1}"
@@ -13,6 +13,7 @@ import_settings_local() {
   local password="${3}"
   local clean="${4:-false}"
   local subsite_prefix="${5:-}"
+  local skip_hash_salt="${6:-false}"
 
   if [[ ! -f "${php_file}" ]]; then
     ui_error "File not found: ${php_file}"
@@ -35,9 +36,10 @@ import_settings_local() {
     ddev_status=$(ddev describe -j 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('raw',{}).get('status',''))" 2>/dev/null || true)
     if [[ "${ddev_status}" == "running" ]]; then
       local php_output
+      local php_skip_arg=""
+      [[ "${skip_hash_salt}" == "true" ]] && php_skip_arg="--skip-hash-salt"
       php_output=$(ddev exec php /var/www/html/.ddev/secret-vault/extract-secrets.php \
-        "/var/www/html/${php_file}" 2>/dev/null) || php_output=""
-      # Only use if it's valid JSON (guards against PHP notices/warnings mixed in)
+        "/var/www/html/${php_file}" ${php_skip_arg} 2>/dev/null) || php_output=""
       if python3 -c "import sys,json; json.loads(sys.stdin.read())" <<< "${php_output}" 2>/dev/null; then
         extracted_json="${php_output}"
       fi
@@ -46,7 +48,7 @@ import_settings_local() {
 
   # Fall back to pure-Python regex extraction
   if [[ -z "${extracted_json}" ]] || [[ "${extracted_json}" == "{}" ]]; then
-    extracted_json=$(_regex_extract_php_secrets "${php_file}")
+    extracted_json=$(_regex_extract_php_secrets "${php_file}" "${skip_hash_salt}")
   fi
 
   # Final validation — ensure we have parseable JSON
@@ -95,6 +97,53 @@ for k, v in sorted(data.items()):
   if ! ui_confirm "Import all into vault?"; then
     ui_info "Import cancelled."
     return 0
+  fi
+
+  # If skip_hash_salt is enabled and DRUPAL_HASH_SALT already exists in the vault,
+  # ask the user whether to remove it.
+  if [[ "${skip_hash_salt}" == "true" ]]; then
+    local current_vault_json
+    current_vault_json=$(crypto_decrypt "${vault_file}" "${password}")
+    local has_existing_hash_salt
+    has_existing_hash_salt=$(python3 -c "
+import sys, json
+data = json.loads(sys.stdin.read())
+# Check both plain key and any subsite-prefixed variant
+for k in data.get('secrets', {}).keys():
+    if k == 'DRUPAL_HASH_SALT' or k.endswith('__DRUPAL_HASH_SALT'):
+        print('true')
+        sys.exit(0)
+print('false')
+" <<< "${current_vault_json}")
+
+    if [[ "${has_existing_hash_salt}" == "true" ]]; then
+      ui_warn "skip-hash-salt is enabled, but DRUPAL_HASH_SALT already exists in the vault."
+      if ui_confirm "Remove existing DRUPAL_HASH_SALT from vault?"; then
+        local now_remove
+        now_remove=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        local rm_tmp
+        rm_tmp=$(mktemp)
+        echo "${current_vault_json}" > "${rm_tmp}"
+        local removed_json
+        removed_json=$(python3 - "${rm_tmp}" <<'PYEOF'
+import sys, json
+with open(sys.argv[1]) as f:
+    data = json.loads(f.read())
+keys_to_remove = [k for k in list(data["secrets"].keys())
+                  if k == "DRUPAL_HASH_SALT" or k.endswith("__DRUPAL_HASH_SALT")]
+for k in keys_to_remove:
+    del data["secrets"][k]
+    data["metadata"].pop(k, None)
+print(json.dumps(data, indent=2))
+PYEOF
+        )
+        rm -f "${rm_tmp}"
+        crypto_encrypt "${removed_json}" "${vault_file}" "${password}"
+        ui_success "Removed DRUPAL_HASH_SALT from vault."
+      else
+        ui_dim "  Kept existing DRUPAL_HASH_SALT in vault."
+      fi
+    fi
   fi
 
   # Load current vault JSON
@@ -153,41 +202,41 @@ PYEOF
 # ---------------------------------------------------------------------------
 _regex_extract_php_secrets() {
   local php_file="${1}"
+  local skip_hash_salt="${2:-false}"
 
-  python3 - "${php_file}" <<'PYEOF'
+  python3 - "${php_file}" "${skip_hash_salt}" <<'PYEOF'
 import sys, re, json
 
 php_file = sys.argv[1]
+skip_hash_salt = sys.argv[2] == "true"
 with open(php_file) as f:
     raw_content = f.read()
 
-# Strip commented lines (// and # single-line comments) and /* ... */ block comments
-# so we don't extract secrets from commented-out code (often found in settings files).
+# Strip commented lines and block comments
 import re as _re
-content = _re.sub(r'/\*.*?\*/', '', raw_content, flags=_re.DOTALL)  # block comments
+content = _re.sub(r'/\*.*?\*/', '', raw_content, flags=_re.DOTALL)
 content = "\n".join(
     line for line in content.splitlines()
     if not _re.match(r'^\s*(//|#)', line)
 )
 
 secrets = {}
-
-# Pattern helpers
 QUOTED = r"""(?:'([^']*)'|"([^"]*)")"""
 
 def first_group(*groups):
     return next((g for g in groups if g is not None), None)
 
 # $settings['hash_salt'] = '...'
-for m in re.finditer(r"""\$settings\s*\[\s*'hash_salt'\s*\]\s*=\s*""" + QUOTED, content):
-    secrets["DRUPAL_HASH_SALT"] = first_group(m.group(1), m.group(2))
+if not skip_hash_salt:
+    for m in re.finditer(r"""\$settings\s*\[\s*'hash_salt'\s*\]\s*=\s*""" + QUOTED, content):
+        secrets["DRUPAL_HASH_SALT"] = first_group(m.group(1), m.group(2))
 
-# $settings['hash_salt'] = $settings['hash_salt'] ?? '...'
-for m in re.finditer(
-    r"""\$settings\s*\[\s*'hash_salt'\s*\]\s*=\s*\$settings\s*\[\s*'hash_salt'\s*\]\s*\?\?\s*""" + QUOTED,
-    content,
-):
-    secrets["DRUPAL_HASH_SALT"] = first_group(m.group(1), m.group(2))
+    # $settings['hash_salt'] = $settings['hash_salt'] ?? '...'
+    for m in re.finditer(
+        r"""\$settings\s*\[\s*'hash_salt'\s*\]\s*=\s*\$settings\s*\[\s*'hash_salt'\s*\]\s*\?\?\s*""" + QUOTED,
+        content,
+    ):
+        secrets["DRUPAL_HASH_SALT"] = first_group(m.group(1), m.group(2))
 
 # $databases['default']['default']['password']  = '...'
 for m in re.finditer(r"""\$databases\s*\[[^\]]*\]\s*\[[^\]]*\]\s*\[[^\]]*'password'[^\]]*\]\s*=\s*""" + QUOTED, content):

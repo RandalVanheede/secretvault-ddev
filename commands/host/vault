@@ -17,7 +17,7 @@ source "${HELPERS_DIR}/crypto.sh"
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-SECRET_VAULT_VERSION=$(grep '^version:' "${SCRIPT_DIR}/../../addon-metadata/ddev-secret-vault/manifest.yaml" 2>/dev/null | awk '{print $2}' | tr -d '[:space:]')
+SECRET_VAULT_VERSION=$(grep '^version:' "${SCRIPT_DIR}/../../addon-metadata/ddev-secret-vault/manifest.yaml" 2>/dev/null | awk '{print $2}' | tr -d '[:space:]' || true)
 VAULT_DIR="${HOME}/.ddev/secret-vault"
 PROJECT_NAME=""
 VAULT_FILE=""
@@ -549,6 +549,7 @@ cmd_change_password() {
 cmd_import() {
   local from_file=""
   local clean=false
+  local skip_hash_salt=""
   export ASSUME_YES=false
 
   while [[ $# -gt 0 ]]; do
@@ -556,6 +557,7 @@ cmd_import() {
       --from=*) from_file="${1#--from=}"; shift ;;
       --from)   from_file="${2}"; shift 2 ;;
       --clean)  clean=true; shift ;;
+      --skip-hash-salt) skip_hash_salt=true; shift ;;
       -y|--yes) export ASSUME_YES=true; shift ;;
       *) shift ;;
     esac
@@ -566,8 +568,12 @@ cmd_import() {
 
   local password
   password=$(crypto_get_master_password)
-  # Validate password by decrypting
   crypto_decrypt "${VAULT_FILE}" "${password}" > /dev/null
+
+  # If --skip-hash-salt not passed on CLI, check vault config for persisted preference
+  if [[ -z "${skip_hash_salt}" ]]; then
+    skip_hash_salt=$(_vault_config_get "skip_hash_salt" "${password}" || echo "false")
+  fi
 
   source "${HELPERS_DIR}/import-env.sh"
   source "${HELPERS_DIR}/import-settings-local.sh"
@@ -577,7 +583,7 @@ cmd_import() {
       *.php)
         local subsite_name
         subsite_name=$(basename "$(dirname "${from_file}")")
-        import_settings_local "${from_file}" "${VAULT_FILE}" "${password}" "${clean}" "${subsite_name}"
+        import_settings_local "${from_file}" "${VAULT_FILE}" "${password}" "${clean}" "${subsite_name}" "${skip_hash_salt}"
         ;;
       *)     import_env_file "${from_file}" "${VAULT_FILE}" "${password}" "${clean}" ;;
     esac
@@ -601,7 +607,7 @@ cmd_import() {
         local subsite_name
         subsite_name=$(basename "$(dirname "${candidate}")")
         ui_info "Found ${candidate} (subsite: ${subsite_name})"
-        import_settings_local "${candidate}" "${VAULT_FILE}" "${password}" "${clean}" "${subsite_name}"
+        import_settings_local "${candidate}" "${VAULT_FILE}" "${password}" "${clean}" "${subsite_name}" "${skip_hash_salt}"
         (( found++ )) || true
       done
     fi
@@ -613,6 +619,114 @@ cmd_import() {
   fi
 
   _sync_project_path_metadata || true
+}
+
+cmd_config() {
+  local key="${1:-}"
+  local value="${2:-}"
+
+  if [[ -z "${key}" ]]; then
+    ui_error "Usage: ddev vault config KEY [VALUE]"
+    ui_dim "  Available config keys:"
+    ui_dim "    skip-hash-salt   true|false   Skip DRUPAL_HASH_SALT during import (default: false)"
+    exit 1
+  fi
+
+  # Normalise key: accept both forms (skip-hash-salt and skip_hash_salt)
+  local norm_key
+  norm_key=$(echo "${key}" | tr '-' '_')
+
+  local allowed_keys=("skip_hash_salt")
+  local valid=false
+  for k in "${allowed_keys[@]}"; do
+    [[ "${norm_key}" == "${k}" ]] && valid=true && break
+  done
+  if [[ "${valid}" != true ]]; then
+    ui_error "Unknown config key '${key}'."
+    ui_dim "  Available config keys: skip-hash-salt"
+    exit 1
+  fi
+
+  bootstrap
+  _require_vault
+
+  local password
+  password=$(crypto_get_master_password)
+
+  # Read-only mode when no value given
+  if [[ -z "${value}" ]]; then
+    local current
+    current=$(_vault_config_get "${norm_key}" "${password}" || echo "false")
+    ui_info "vault config ${key} = ${current}"
+    exit 0
+  fi
+
+  # Validate boolean value
+  case "${value}" in
+    true|false) ;;
+    *)
+      ui_error "Value for '${key}' must be 'true' or 'false'."
+      exit 1
+      ;;
+  esac
+
+  local json
+  json=$(crypto_decrypt "${VAULT_FILE}" "${password}")
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local json_tmp
+  json_tmp=$(mktemp)
+  echo "${json}" > "${json_tmp}"
+  local updated_json
+  updated_json=$(python3 - "${norm_key}" "${value}" "${now}" "${json_tmp}" <<'PYEOF'
+import sys, json
+key, value, now, json_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+bool_value = value == "true"
+with open(json_file) as f:
+    data = json.loads(f.read())
+vault_meta = data.setdefault("metadata", {}).setdefault("vault", {})
+vault_meta[key] = bool_value
+data["updated"] = now
+print(json.dumps(data, indent=2))
+PYEOF
+  )
+  rm -f "${json_tmp}"
+
+  crypto_encrypt "${updated_json}" "${VAULT_FILE}" "${password}"
+  _sync_project_path_metadata || true
+
+  if [[ "${value}" == "true" ]]; then
+    ui_success "vault config: ${key} = true (DRUPAL_HASH_SALT will be skipped on future imports)"
+  else
+    ui_success "vault config: ${key} = false (DRUPAL_HASH_SALT will be imported normally)"
+  fi
+}
+
+# Helper: read a config value from vault metadata.vault
+# Usage: _vault_config_get KEY PASSWORD
+# Prints "true" or "false"; returns 0 always.
+_vault_config_get() {
+  local config_key="${1}"
+  local password="${2}"
+
+  [[ -f "${VAULT_FILE}" ]] || { echo "false"; return 0; }
+
+  local json
+  json=$(crypto_decrypt "${VAULT_FILE}" "${password}" 2>/dev/null) || { echo "false"; return 0; }
+
+  local json_tmp
+  json_tmp=$(mktemp)
+  echo "${json}" > "${json_tmp}"
+  python3 - "${config_key}" "${json_tmp}" <<'PYEOF'
+import sys, json
+key, json_file = sys.argv[1], sys.argv[2]
+with open(json_file) as f:
+    data = json.loads(f.read())
+val = data.get("metadata", {}).get("vault", {}).get(key, False)
+print("true" if val else "false")
+PYEOF
+  rm -f "${json_tmp}"
 }
 
 cmd_ui() {
@@ -734,6 +848,12 @@ cmd_help() {
     import                   Auto-detect and import secrets from .env / settings.local.php
     import --from=FILE       Import from a specific file
     import --clean           Import AND sanitize source files (creates .bak backup)
+    import --skip-hash-salt  Import without extracting DRUPAL_HASH_SALT (one-off)
+
+  CONFIG COMMANDS
+    config skip-hash-salt [true|false]
+                             Get or set whether DRUPAL_HASH_SALT is skipped on import
+                             (persisted in vault metadata for all future imports)
 
   UTILITY COMMANDS
     ui                       Open the desktop application
@@ -761,6 +881,7 @@ case "${COMMAND}" in
   clean)           cmd_clean "$@" ;;
   import)          cmd_import "$@" ;;
   export)          cmd_export "$@" ;;
+  config)          cmd_config "$@" ;;
   status)          cmd_status "$@" ;;
   ui)              cmd_ui "$@" ;;
   change-password) cmd_change_password "$@" ;;

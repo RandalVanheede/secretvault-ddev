@@ -59,6 +59,10 @@ ddev start
 | `ddev vault import --from=.env` | Import from a specific file |
 | `ddev vault import --from=web/sites/default/settings.local.php` | Import from a PHP file |
 | `ddev vault import --clean` | Import AND sanitize source files (backup created first) |
+| `ddev vault import --skip-hash-salt` | Import without extracting `DRUPAL_HASH_SALT` (one-off) |
+| `ddev vault config skip-hash-salt true` | Persist skip-hash-salt preference for all future imports |
+| `ddev vault config skip-hash-salt false` | Re-enable hash salt import |
+| `ddev vault config skip-hash-salt` | Show current skip-hash-salt setting |
 
 ### Utility
 
@@ -149,6 +153,22 @@ After importing, shows a diff and (with confirmation) replaces hardcoded values:
 ```
 
 A `.bak` backup is always created before any modifications.
+
+### `--skip-hash-salt`: Exclude the Drupal Hash Salt
+
+The Drupal hash salt is extracted by default because it can be exploited if leaked. If you manage it separately (e.g. via a different secrets manager) you can opt out:
+
+**One-off:**
+```bash
+ddev vault import --skip-hash-salt
+```
+
+**Persisted for all future imports on this project:**
+```bash
+ddev vault config skip-hash-salt true
+```
+
+When `skip-hash-salt` is active and `DRUPAL_HASH_SALT` already exists in the vault, you will be prompted whether to remove it.
 
 ---
 
